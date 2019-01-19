@@ -15,12 +15,12 @@ func TestCLIIntegration(t *testing.T) {
 		testBuildContainerdExporter,
 		testPrune,
 		testUsage,
-	})
+	},
+		integration.WithMirroredImages(integration.OfficialImages("busybox:latest")),
+	)
 }
 
 func testUsage(t *testing.T, sb integration.Sandbox) {
-	t.Parallel()
-
 	require.NoError(t, sb.Cmd().Run())
 
 	require.NoError(t, sb.Cmd("--help").Run())

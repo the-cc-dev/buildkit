@@ -3,6 +3,7 @@ package solver
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/moby/buildkit/solver/internal/pipe"
 	digest "github.com/opencontainers/go-digest"
@@ -271,7 +272,7 @@ func (e *edge) currentIndexKey() *CacheKey {
 func (e *edge) skipPhase2SlowCache(dep *dep) bool {
 	isPhase1 := false
 	for _, dep := range e.deps {
-		if !dep.slowCacheComplete && e.slowCacheFunc(dep) != nil && len(dep.keyMap) == 0 {
+		if (!dep.slowCacheComplete && e.slowCacheFunc(dep) != nil || dep.state < edgeStatusCacheSlow) && len(dep.keyMap) == 0 {
 			isPhase1 = true
 			break
 		}
@@ -845,7 +846,7 @@ func (e *edge) execOp(ctx context.Context) (interface{}, error) {
 	var exporters []CacheExporter
 
 	for _, cacheKey := range cacheKeys {
-		ck, err := e.op.Cache().Save(cacheKey, res)
+		ck, err := e.op.Cache().Save(cacheKey, res, time.Now())
 		if err != nil {
 			return nil, err
 		}

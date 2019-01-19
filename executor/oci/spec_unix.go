@@ -11,6 +11,7 @@ import (
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
+	"github.com/containerd/continuity/fs"
 	"github.com/mitchellh/hashstructure"
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/snapshot"
@@ -21,14 +22,35 @@ import (
 
 // Ideally we don't have to import whole containerd just for the default spec
 
+// ProcMode configures PID namespaces
+type ProcessMode int
+
+const (
+	// ProcessSandbox unshares pidns and mount procfs.
+	ProcessSandbox ProcessMode = iota
+	// NoProcessSandbox uses host pidns and bind-mount procfs.
+	// Note that NoProcessSandbox allows build containers to kill (and potentially ptrace) an arbitrary process in the BuildKit host namespace.
+	// NoProcessSandbox should be enabled only when the BuildKit is running in a container as an unprivileged user.
+	NoProcessSandbox
+)
+
 // GenerateSpec generates spec using containerd functionality.
-func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mount, id, resolvConf, hostsFile string, namespace network.Namespace, opts ...oci.SpecOpts) (*specs.Spec, func(), error) {
+// opts are ignored for s.Process, s.Hostname, and s.Mounts .
+func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mount, id, resolvConf, hostsFile string, namespace network.Namespace, processMode ProcessMode, opts ...oci.SpecOpts) (*specs.Spec, func(), error) {
 	c := &containers.Container{
 		ID: id,
 	}
 	_, ok := namespaces.Namespace(ctx)
 	if !ok {
 		ctx = namespaces.WithNamespace(ctx, "buildkit")
+	}
+
+	switch processMode {
+	case NoProcessSandbox:
+		// Mount for /proc is replaced in GetMounts()
+		opts = append(opts,
+			oci.WithHostNamespace(specs.PIDNamespace))
+		// TODO(AkihiroSuda): Configure seccomp to disable ptrace (and prctl?) explicitly
 	}
 
 	// Note that containerd.GenerateSpec is namespaced so as to make
@@ -43,11 +65,26 @@ func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mou
 	s.Process.Args = meta.Args
 	s.Process.Env = meta.Env
 	s.Process.Cwd = meta.Cwd
+	s.Process.Rlimits = nil           // reset open files limit
+	s.Process.NoNewPrivileges = false // reset nonewprivileges
+	s.Hostname = "buildkitsandbox"
 
-	s.Mounts = GetMounts(ctx,
+	s.Mounts, err = GetMounts(ctx,
+		withProcessMode(processMode),
 		withROBind(resolvConf, "/etc/resolv.conf"),
 		withROBind(hostsFile, "/etc/hosts"),
 	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	s.Mounts = append(s.Mounts, specs.Mount{
+		Destination: "/sys/fs/cgroup",
+		Type:        "cgroup",
+		Source:      "cgroup",
+		Options:     []string{"ro", "nosuid", "noexec", "nodev"},
+	})
+
 	// TODO: User
 
 	sm := &submounts{}
@@ -114,7 +151,11 @@ func (s *submounts) subMount(m mount.Mount, subPath string) (mount.Mount, error)
 		return mount.Mount{}, nil
 	}
 	if mr, ok := s.m[h]; ok {
-		return sub(mr.mount, subPath), nil
+		sm, err := sub(mr.mount, subPath)
+		if err != nil {
+			return mount.Mount{}, nil
+		}
+		return sm, nil
 	}
 
 	lm := snapshot.LocalMounterWithMounts([]mount.Mount{m})
@@ -140,7 +181,11 @@ func (s *submounts) subMount(m mount.Mount, subPath string) (mount.Mount, error)
 		unmount: lm.Unmount,
 	}
 
-	return sub(s.m[h].mount, subPath), nil
+	sm, err := sub(s.m[h].mount, subPath)
+	if err != nil {
+		return mount.Mount{}, err
+	}
+	return sm, nil
 }
 
 func (s *submounts) cleanup() {
@@ -157,7 +202,11 @@ func (s *submounts) cleanup() {
 	wg.Wait()
 }
 
-func sub(m mount.Mount, subPath string) mount.Mount {
-	m.Source = path.Join(m.Source, subPath)
-	return m
+func sub(m mount.Mount, subPath string) (mount.Mount, error) {
+	src, err := fs.RootPath(m.Source, subPath)
+	if err != nil {
+		return mount.Mount{}, err
+	}
+	m.Source = src
+	return m, nil
 }

@@ -21,6 +21,8 @@ import (
 	"github.com/containerd/containerd/sys"
 	"github.com/docker/go-connections/sockets"
 	"github.com/grpc-ecosystem/grpc-opentracing/go/otgrpc"
+	"github.com/moby/buildkit/cache/remotecache"
+	localremotecache "github.com/moby/buildkit/cache/remotecache/local"
 	registryremotecache "github.com/moby/buildkit/cache/remotecache/registry"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
@@ -30,7 +32,7 @@ import (
 	"github.com/moby/buildkit/frontend/gateway"
 	"github.com/moby/buildkit/frontend/gateway/forwarder"
 	"github.com/moby/buildkit/session"
-	"github.com/moby/buildkit/solver/boltdbcachestorage"
+	"github.com/moby/buildkit/solver/bboltcachestorage"
 	"github.com/moby/buildkit/util/apicaps"
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/moby/buildkit/util/appdefaults"
@@ -85,6 +87,7 @@ func main() {
 	app := cli.NewApp()
 	app.Name = "buildkitd"
 	app.Usage = "build daemon"
+	app.Version = version.Version
 
 	defaultConf, md := defaultConf()
 
@@ -500,21 +503,28 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 	frontends["dockerfile.v0"] = forwarder.NewGatewayForwarder(wc, dockerfile.Build)
 	frontends["gateway.v0"] = gateway.NewGatewayFrontend(wc)
 
-	cacheStorage, err := boltdbcachestorage.NewStore(filepath.Join(cfg.Root, "cache.db"))
+	cacheStorage, err := bboltcachestorage.NewStore(filepath.Join(cfg.Root, "cache.db"))
 	if err != nil {
 		return nil, err
 	}
 
 	resolverFn := resolverFunc(cfg)
 
+	remoteCacheExporterFuncs := map[string]remotecache.ResolveCacheExporterFunc{
+		"registry": registryremotecache.ResolveCacheExporterFunc(sessionManager, resolverFn),
+		"local":    localremotecache.ResolveCacheExporterFunc(sessionManager),
+	}
+	remoteCacheImporterFuncs := map[string]remotecache.ResolveCacheImporterFunc{
+		"registry": registryremotecache.ResolveCacheImporterFunc(sessionManager, resolverFn),
+		"local":    localremotecache.ResolveCacheImporterFunc(sessionManager),
+	}
 	return control.NewController(control.Opt{
-		SessionManager:   sessionManager,
-		WorkerController: wc,
-		Frontends:        frontends,
-		// TODO: support non-registry remote cache
-		ResolveCacheExporterFunc: registryremotecache.ResolveCacheExporterFunc(sessionManager, resolverFn),
-		ResolveCacheImporterFunc: registryremotecache.ResolveCacheImporterFunc(sessionManager, resolverFn),
-		CacheKeyStorage:          cacheStorage,
+		SessionManager:            sessionManager,
+		WorkerController:          wc,
+		Frontends:                 frontends,
+		ResolveCacheExporterFuncs: remoteCacheExporterFuncs,
+		ResolveCacheImporterFuncs: remoteCacheImporterFuncs,
+		CacheKeyStorage:           cacheStorage,
 	})
 }
 

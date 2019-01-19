@@ -1,4 +1,4 @@
-# syntax=tonistiigi/dockerfile:runmount20180828
+# syntax=docker/dockerfile:1.0-experimental
 
 # protoc is dynamically linked to glibc to can't use golang:1.10-alpine
 FROM golang:1.11 AS gobuild-base
@@ -31,7 +31,7 @@ RUN --mount=target=/tmp/src \
 	git ls-files -m --others -- **/*.pb.go | tar -cf - --files-from - | tar -C /generated-files -xf -
 
 FROM scratch AS update
-COPY --from=generated generated-files /
+COPY --from=generated /generated-files /generated-files
 
 FROM gobuild-base AS validate
 RUN --mount=target=/tmp/src \

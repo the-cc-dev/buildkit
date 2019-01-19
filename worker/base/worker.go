@@ -46,6 +46,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -118,15 +119,18 @@ func NewWorker(opt WorkerOpt) (*Worker, error) {
 
 	sm.Register(is)
 
-	gs, err := git.NewSource(git.Opt{
-		CacheAccessor: cm,
-		MetadataStore: opt.MetadataStore,
-	})
-	if err != nil {
-		return nil, err
+	if err := git.Supported(); err == nil {
+		gs, err := git.NewSource(git.Opt{
+			CacheAccessor: cm,
+			MetadataStore: opt.MetadataStore,
+		})
+		if err != nil {
+			return nil, err
+		}
+		sm.Register(gs)
+	} else {
+		logrus.Warnf("git source cannot be enabled: %v", err)
 	}
-
-	sm.Register(gs)
 
 	hs, err := http.NewSource(http.Opt{
 		CacheAccessor: cm,
@@ -286,7 +290,7 @@ func (w *Worker) Exporter(name string) (exporter.Exporter, error) {
 func (w *Worker) GetRemote(ctx context.Context, ref cache.ImmutableRef, createIfNeeded bool) (*solver.Remote, error) {
 	diffPairs, err := blobs.GetDiffPairs(ctx, w.ContentStore, w.Snapshotter, w.Differ, ref, createIfNeeded)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed calculaing diff pairs for exported snapshot")
+		return nil, errors.Wrap(err, "failed calculating diff pairs for exported snapshot")
 	}
 	if len(diffPairs) == 0 {
 		return nil, nil
@@ -388,10 +392,7 @@ func (w *Worker) unpack(ctx context.Context, descs []ocispec.Descriptor, s cdsna
 
 	var chain []digest.Digest
 	for _, layer := range layers {
-		labels := map[string]string{
-			"containerd.io/uncompressed": layer.Diff.Digest.String(),
-		}
-		if _, err := rootfs.ApplyLayer(ctx, layer, chain, s, w.Applier, cdsnapshot.WithLabels(labels)); err != nil {
+		if _, err := rootfs.ApplyLayer(ctx, layer, chain, s, w.Applier); err != nil {
 			return nil, err
 		}
 		chain = append(chain, layer.Diff.Digest)

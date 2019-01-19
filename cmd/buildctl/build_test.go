@@ -14,13 +14,13 @@ import (
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/continuity/fs/fstest"
+	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/stretchr/testify/require"
 )
 
 func testBuildWithLocalFiles(t *testing.T, sb integration.Sandbox) {
-	t.Parallel()
 	dir, err := tmpdir(
 		fstest.CreateFile("foo", []byte("bar"), 0600),
 	)
@@ -44,7 +44,6 @@ func testBuildWithLocalFiles(t *testing.T, sb integration.Sandbox) {
 }
 
 func testBuildLocalExporter(t *testing.T, sb integration.Sandbox) {
-	t.Parallel()
 	st := llb.Image("busybox").
 		Run(llb.Shlex("sh -c 'echo -n bar > /out/foo'"))
 
@@ -69,8 +68,6 @@ func testBuildLocalExporter(t *testing.T, sb integration.Sandbox) {
 }
 
 func testBuildContainerdExporter(t *testing.T, sb integration.Sandbox) {
-	t.Parallel()
-
 	var cdAddress string
 	if cd, ok := sb.(interface {
 		ContainerdAddress() string
@@ -122,4 +119,109 @@ func tmpdir(appliers ...fstest.Applier) (string, error) {
 		return "", err
 	}
 	return tmpdir, nil
+}
+
+func TestParseExportCache(t *testing.T) {
+	type testCase struct {
+		exportCaches          []string // --export-cache
+		legacyExportCacheOpts []string // --export-cache-opt (legacy)
+		expected              []client.CacheOptionsEntry
+		expectedErr           string
+	}
+	testCases := []testCase{
+		{
+			exportCaches: []string{"type=registry,ref=example.com/foo/bar"},
+			expected: []client.CacheOptionsEntry{
+				{
+					Type: "registry",
+					Attrs: map[string]string{
+						"ref":  "example.com/foo/bar",
+						"mode": "min",
+					},
+				},
+			},
+		},
+		{
+			exportCaches:          []string{"example.com/foo/bar"},
+			legacyExportCacheOpts: []string{"mode=max"},
+			expected: []client.CacheOptionsEntry{
+				{
+					Type: "registry",
+					Attrs: map[string]string{
+						"ref":  "example.com/foo/bar",
+						"mode": "max",
+					},
+				},
+			},
+		},
+		{
+			exportCaches:          []string{"type=registry,ref=example.com/foo/bar"},
+			legacyExportCacheOpts: []string{"mode=max"},
+			expectedErr:           "--export-cache-opt is not supported for the specified --export-cache",
+		},
+		// TODO: test multiple exportCaches (valid for CLI but not supported by solver)
+
+	}
+	for _, tc := range testCases {
+		ex, err := parseExportCache(tc.exportCaches, tc.legacyExportCacheOpts)
+		if tc.expectedErr == "" {
+			require.EqualValues(t, tc.expected, ex)
+		} else {
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.expectedErr)
+		}
+	}
+}
+
+func TestParseImportCache(t *testing.T) {
+	type testCase struct {
+		importCaches []string // --import-cache
+		expected     []client.CacheOptionsEntry
+		expectedErr  string
+	}
+	testCases := []testCase{
+		{
+			importCaches: []string{"type=registry,ref=example.com/foo/bar", "type=local,store=/path/to/store"},
+			expected: []client.CacheOptionsEntry{
+				{
+					Type: "registry",
+					Attrs: map[string]string{
+						"ref": "example.com/foo/bar",
+					},
+				},
+				{
+					Type: "local",
+					Attrs: map[string]string{
+						"store": "/path/to/store",
+					},
+				},
+			},
+		},
+		{
+			importCaches: []string{"example.com/foo/bar", "example.com/baz/qux"},
+			expected: []client.CacheOptionsEntry{
+				{
+					Type: "registry",
+					Attrs: map[string]string{
+						"ref": "example.com/foo/bar",
+					},
+				},
+				{
+					Type: "registry",
+					Attrs: map[string]string{
+						"ref": "example.com/baz/qux",
+					},
+				},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		im, err := parseImportCache(tc.importCaches)
+		if tc.expectedErr == "" {
+			require.EqualValues(t, tc.expected, im)
+		} else {
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.expectedErr)
+		}
+	}
 }

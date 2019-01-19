@@ -14,6 +14,7 @@ import (
 	"github.com/docker/distribution/reference"
 	apitypes "github.com/moby/buildkit/api/types"
 	"github.com/moby/buildkit/cache"
+	cacheutil "github.com/moby/buildkit/cache/util"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/executor"
@@ -396,13 +397,37 @@ func (lbf *llbBridgeForwarder) ResolveImageConfig(ctx context.Context, req *pb.R
 	}, nil
 }
 
+func translateLegacySolveRequest(req *pb.SolveRequest) error {
+	// translates ImportCacheRefs to new CacheImports (v0.4.0)
+	for _, legacyImportRef := range req.ImportCacheRefsDeprecated {
+		im := &pb.CacheOptionsEntry{
+			Type:  "registry",
+			Attrs: map[string]string{"ref": legacyImportRef},
+		}
+		// FIXME(AkihiroSuda): skip append if already exists
+		req.CacheImports = append(req.CacheImports, im)
+	}
+	req.ImportCacheRefsDeprecated = nil
+	return nil
+}
+
 func (lbf *llbBridgeForwarder) Solve(ctx context.Context, req *pb.SolveRequest) (*pb.SolveResponse, error) {
+	if err := translateLegacySolveRequest(req); err != nil {
+		return nil, err
+	}
+	var cacheImports []frontend.CacheOptionsEntry
+	for _, e := range req.CacheImports {
+		cacheImports = append(cacheImports, frontend.CacheOptionsEntry{
+			Type:  e.Type,
+			Attrs: e.Attrs,
+		})
+	}
 	ctx = tracing.ContextWithSpanFromContext(ctx, lbf.callCtx)
 	res, err := lbf.llbBridge.Solve(ctx, frontend.SolveRequest{
-		Definition:      req.Definition,
-		Frontend:        req.Frontend,
-		FrontendOpt:     req.FrontendOpt,
-		ImportCacheRefs: req.ImportCacheRefs,
+		Definition:   req.Definition,
+		Frontend:     req.Frontend,
+		FrontendOpt:  req.FrontendOpt,
+		CacheImports: cacheImports,
 	})
 	if err != nil {
 		return nil, err
@@ -479,29 +504,81 @@ func (lbf *llbBridgeForwarder) ReadFile(ctx context.Context, req *pb.ReadFileReq
 		return nil, errors.Errorf("no such ref: %v", req.Ref)
 	}
 	if ref == nil {
-		return nil, errors.Wrapf(os.ErrNotExist, "%s no found", req.FilePath)
+		return nil, errors.Wrapf(os.ErrNotExist, "%s not found", req.FilePath)
 	}
 	workerRef, ok := ref.Sys().(*worker.WorkerRef)
 	if !ok {
 		return nil, errors.Errorf("invalid ref: %T", ref.Sys())
 	}
 
-	newReq := cache.ReadRequest{
+	newReq := cacheutil.ReadRequest{
 		Filename: req.FilePath,
 	}
 	if r := req.Range; r != nil {
-		newReq.Range = &cache.FileRange{
+		newReq.Range = &cacheutil.FileRange{
 			Offset: int(r.Offset),
 			Length: int(r.Length),
 		}
 	}
 
-	dt, err := cache.ReadFile(ctx, workerRef.ImmutableRef, newReq)
+	dt, err := cacheutil.ReadFile(ctx, workerRef.ImmutableRef, newReq)
 	if err != nil {
 		return nil, err
 	}
 
 	return &pb.ReadFileResponse{Data: dt}, nil
+}
+
+func (lbf *llbBridgeForwarder) ReadDir(ctx context.Context, req *pb.ReadDirRequest) (*pb.ReadDirResponse, error) {
+	ctx = tracing.ContextWithSpanFromContext(ctx, lbf.callCtx)
+	lbf.mu.Lock()
+	ref, ok := lbf.refs[req.Ref]
+	lbf.mu.Unlock()
+	if !ok {
+		return nil, errors.Errorf("no such ref: %v", req.Ref)
+	}
+	if ref == nil {
+		return nil, errors.Wrapf(os.ErrNotExist, "%s not found", req.DirPath)
+	}
+	workerRef, ok := ref.Sys().(*worker.WorkerRef)
+	if !ok {
+		return nil, errors.Errorf("invalid ref: %T", ref.Sys())
+	}
+
+	newReq := cacheutil.ReadDirRequest{
+		Path:           req.DirPath,
+		IncludePattern: req.IncludePattern,
+	}
+	entries, err := cacheutil.ReadDir(ctx, workerRef.ImmutableRef, newReq)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.ReadDirResponse{Entries: entries}, nil
+}
+
+func (lbf *llbBridgeForwarder) StatFile(ctx context.Context, req *pb.StatFileRequest) (*pb.StatFileResponse, error) {
+	ctx = tracing.ContextWithSpanFromContext(ctx, lbf.callCtx)
+	lbf.mu.Lock()
+	ref, ok := lbf.refs[req.Ref]
+	lbf.mu.Unlock()
+	if !ok {
+		return nil, errors.Errorf("no such ref: %v", req.Ref)
+	}
+	if ref == nil {
+		return nil, errors.Wrapf(os.ErrNotExist, "%s not found", req.Path)
+	}
+	workerRef, ok := ref.Sys().(*worker.WorkerRef)
+	if !ok {
+		return nil, errors.Errorf("invalid ref: %T", ref.Sys())
+	}
+
+	st, err := cacheutil.StatFile(ctx, workerRef.ImmutableRef, req.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.StatFileResponse{Stat: st}, nil
 }
 
 func (lbf *llbBridgeForwarder) Ping(context.Context, *pb.PingRequest) (*pb.PongResponse, error) {

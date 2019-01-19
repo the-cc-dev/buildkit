@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/containerd/containerd/content/local"
 	"github.com/containerd/containerd/diff/apply"
 	"github.com/containerd/containerd/diff/walking"
@@ -14,6 +13,7 @@ import (
 	"github.com/containerd/containerd/platforms"
 	ctdsnapshot "github.com/containerd/containerd/snapshots"
 	"github.com/moby/buildkit/cache/metadata"
+	"github.com/moby/buildkit/executor/oci"
 	"github.com/moby/buildkit/executor/runcexecutor"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/util/network"
@@ -22,6 +22,7 @@ import (
 	"github.com/moby/buildkit/worker/base"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
+	bolt "go.etcd.io/bbolt"
 )
 
 // SnapshotterFactory instantiates a snapshotter
@@ -33,7 +34,7 @@ type SnapshotterFactory struct {
 // NewWorkerOpt creates a WorkerOpt.
 // But it does not set the following fields:
 //  - SessionManager
-func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, labels map[string]string) (base.WorkerOpt, error) {
+func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, processMode oci.ProcessMode, labels map[string]string) (base.WorkerOpt, error) {
 	var opt base.WorkerOpt
 	name := "runc-" + snFactory.Name
 	root = filepath.Join(root, name)
@@ -48,7 +49,8 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, labe
 		// Root directory
 		Root: filepath.Join(root, "executor"),
 		// without root privileges
-		Rootless: rootless,
+		Rootless:    rootless,
+		ProcessMode: processMode,
 	}, network.Default())
 	if err != nil {
 		return opt, err

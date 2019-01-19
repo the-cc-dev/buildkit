@@ -124,7 +124,7 @@ func (p *Puller) Pull(ctx context.Context) (*Pulled, error) {
 		childrenHandler := images.ChildrenHandler(p.ContentStore)
 		// Set any children labels for that content
 		childrenHandler = images.SetChildrenLabels(p.ContentStore, childrenHandler)
-		// Filter the childen by the platform
+		// Filter the children by the platform
 		childrenHandler = images.FilterPlatforms(childrenHandler, platform)
 		// Limit manifests pulled to the best match in an index
 		childrenHandler = images.LimitManifests(childrenHandler, platform, 1)
@@ -241,8 +241,7 @@ func unpack(ctx context.Context, desc ocispec.Descriptor, cs content.Store, csh 
 	var chain []digest.Digest
 	for _, layer := range layers {
 		labels := map[string]string{
-			"containerd.io/gc.root":      time.Now().UTC().Format(time.RFC3339Nano),
-			"containerd.io/uncompressed": layer.Diff.Digest.String(),
+			"containerd.io/gc.root": time.Now().UTC().Format(time.RFC3339Nano),
 		}
 		if _, err := rootfs.ApplyLayer(ctx, layer, chain, csh, applier, ctdsnapshot.WithLabels(labels)); err != nil {
 			return "", err

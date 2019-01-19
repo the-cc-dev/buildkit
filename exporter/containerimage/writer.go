@@ -158,7 +158,7 @@ func (ic *ImageWriter) exportLayers(ctx context.Context, refs ...cache.Immutable
 			eg.Go(func() error {
 				diffPairs, err := blobs.GetDiffPairs(ctx, ic.opt.ContentStore, ic.opt.Snapshotter, ic.opt.Differ, ref, true)
 				if err != nil {
-					return errors.Wrap(err, "failed calculaing diff pairs for exported snapshot")
+					return errors.Wrap(err, "failed calculating diff pairs for exported snapshot")
 				}
 				out[i] = diffPairs
 				return nil
@@ -405,6 +405,37 @@ func normalizeLayersAndHistory(diffs []blobs.DiffPair, history []ocispec.History
 			} else {
 				layerIndex++
 			}
+		}
+		history[i] = h
+	}
+
+	// Find the first new layer time. Otherwise, the history item for a first
+	// metadata command would be the creation time of a base image layer.
+	// If there is no such then the last layer with timestamp.
+	var created *time.Time
+	var noCreatedTime bool
+	for _, h := range history {
+		if h.Created != nil {
+			created = h.Created
+			if noCreatedTime {
+				break
+			}
+		} else {
+			noCreatedTime = true
+		}
+	}
+
+	// Fill in created times for all history items to be either the first new
+	// layer time or the previous layer.
+	noCreatedTime = false
+	for i, h := range history {
+		if h.Created != nil {
+			if noCreatedTime {
+				created = h.Created
+			}
+		} else {
+			noCreatedTime = true
+			h.Created = created
 		}
 		history[i] = h
 	}

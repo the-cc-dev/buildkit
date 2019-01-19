@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"testing"
 	"time"
 
@@ -30,6 +31,7 @@ func init() {
 			register(&oci{uid: uid, gid: gid})
 		}
 	}
+
 }
 
 type oci struct {
@@ -44,7 +46,12 @@ func (s *oci) Name() string {
 	return "oci"
 }
 
-func (s *oci) New() (Sandbox, func() error, error) {
+func (s *oci) New(opt ...SandboxOpt) (Sandbox, func() error, error) {
+	var c SandboxConf
+	for _, o := range opt {
+		o(&c)
+	}
+
 	if err := lookupBinary("buildkitd"); err != nil {
 		return nil, nil, err
 	}
@@ -54,8 +61,23 @@ func (s *oci) New() (Sandbox, func() error, error) {
 	logs := map[string]*bytes.Buffer{}
 	// Include use of --oci-worker-labels to trigger https://github.com/moby/buildkit/pull/603
 	buildkitdArgs := []string{"buildkitd", "--oci-worker=true", "--containerd-worker=false", "--oci-worker-labels=org.mobyproject.buildkit.worker.sandbox=true"}
+
+	deferF := &multiCloser{}
+
+	if c.mirror != "" {
+		dir, err := configWithMirror(c.mirror)
+		if err != nil {
+			return nil, nil, err
+		}
+		deferF.append(func() error {
+			return os.RemoveAll(dir)
+		})
+		buildkitdArgs = append(buildkitdArgs, "--config="+filepath.Join(dir, "buildkitd.toml"))
+	}
+
 	if s.uid != 0 {
 		if s.gid == 0 {
+			deferF.F()()
 			return nil, nil, errors.Errorf("unsupported id pair: uid=%d, gid=%d", s.uid, s.gid)
 		}
 		// TODO: make sure the user exists and subuid/subgid are configured.
@@ -63,13 +85,13 @@ func (s *oci) New() (Sandbox, func() error, error) {
 	}
 	buildkitdSock, stop, err := runBuildkitd(buildkitdArgs, logs, s.uid, s.gid)
 	if err != nil {
+		deferF.F()()
 		return nil, nil, err
 	}
 
-	deferF := &multiCloser{}
 	deferF.append(stop)
 
-	return &sandbox{address: buildkitdSock, logs: logs, cleanup: deferF, rootless: s.uid != 0}, deferF.F(), nil
+	return &sandbox{address: buildkitdSock, mv: c.mv, logs: logs, cleanup: deferF, rootless: s.uid != 0}, deferF.F(), nil
 }
 
 type sandbox struct {
@@ -77,6 +99,7 @@ type sandbox struct {
 	logs     map[string]*bytes.Buffer
 	cleanup  *multiCloser
 	rootless bool
+	mv       matrixValue
 }
 
 func (sb *sandbox) Address() string {
@@ -94,7 +117,7 @@ func (sb *sandbox) PrintLogs(t *testing.T) {
 }
 
 func (sb *sandbox) NewRegistry() (string, error) {
-	url, cl, err := newRegistry()
+	url, cl, err := newRegistry("")
 	if err != nil {
 		return "", err
 	}
@@ -116,6 +139,10 @@ func (sb *sandbox) Cmd(args ...string) *exec.Cmd {
 
 func (sb *sandbox) Rootless() bool {
 	return sb.rootless
+}
+
+func (sb *sandbox) Value(k string) interface{} {
+	return sb.mv.values[k].value
 }
 
 func runBuildkitd(args []string, logs map[string]*bytes.Buffer, uid, gid int) (address string, cl func() error, err error) {
@@ -146,6 +173,9 @@ func runBuildkitd(args []string, logs map[string]*bytes.Buffer, uid, gid int) (a
 	args = append(args, "--root", tmpdir, "--addr", address, "--debug")
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = append(os.Environ(), "BUILDKIT_DEBUG_EXEC_OUTPUT=1")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true, // stretch sudo needs this for sigterm
+	}
 
 	if stop, err := startCmd(cmd, logs); err != nil {
 		return "", nil, err

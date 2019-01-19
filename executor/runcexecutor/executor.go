@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/containerd/containerd/contrib/seccomp"
 	"github.com/containerd/containerd/mount"
@@ -38,6 +39,8 @@ type Opt struct {
 	Rootless bool
 	// DefaultCgroupParent is the cgroup-parent name for executor
 	DefaultCgroupParent string
+	// ProcessMode
+	ProcessMode oci.ProcessMode
 }
 
 var defaultCommandCandidates = []string{"buildkit-runc", "runc"}
@@ -49,6 +52,7 @@ type runcExecutor struct {
 	cgroupParent     string
 	rootless         bool
 	networkProviders map[pb.NetMode]network.Provider
+	processMode      oci.ProcessMode
 }
 
 func New(opt Opt, networkProviders map[pb.NetMode]network.Provider) (executor.Executor, error) {
@@ -84,11 +88,15 @@ func New(opt Opt, networkProviders map[pb.NetMode]network.Provider) (executor.Ex
 		return nil, err
 	}
 
+	// clean up old hosts/resolv.conf file. ignore errors
+	os.RemoveAll(filepath.Join(root, "hosts"))
+	os.RemoveAll(filepath.Join(root, "resolv.conf"))
+
 	runtime := &runc.Runc{
 		Command:      cmd,
 		Log:          filepath.Join(root, "runc-log.json"),
 		LogFormat:    runc.JSON,
-		PdeathSignal: syscall.SIGKILL,
+		PdeathSignal: syscall.SIGKILL, // this can still leak the process
 		Setpgid:      true,
 		// we don't execute runc with --rootless=(true|false) explicitly,
 		// so as to support non-runc runtimes
@@ -100,6 +108,7 @@ func New(opt Opt, networkProviders map[pb.NetMode]network.Provider) (executor.Ex
 		cgroupParent:     opt.DefaultCgroupParent,
 		rootless:         opt.Rootless,
 		networkProviders: networkProviders,
+		processMode:      opt.ProcessMode,
 	}
 	return w, nil
 }
@@ -188,7 +197,7 @@ func (w *runcExecutor) Exec(ctx context.Context, meta executor.Meta, root cache.
 		}
 		opts = append(opts, containerdoci.WithCgroup(cgroupsPath))
 	}
-	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, opts...)
+	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, w.processMode, opts...)
 	if err != nil {
 		return err
 	}
@@ -220,16 +229,55 @@ func (w *runcExecutor) Exec(ctx context.Context, meta executor.Meta, root cache.
 		return err
 	}
 
+	// runCtx/killCtx is used for extra check in case the kill command blocks
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				killCtx, timeout := context.WithTimeout(context.Background(), 7*time.Second)
+				if err := w.runc.Kill(killCtx, id, int(syscall.SIGKILL), nil); err != nil {
+					logrus.Errorf("failed to kill runc %s: %+v", id, err)
+					select {
+					case <-killCtx.Done():
+						timeout()
+						cancelRun()
+						return
+					default:
+					}
+				}
+				timeout()
+				select {
+				case <-time.After(50 * time.Millisecond):
+				case <-done:
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
 	logrus.Debugf("> creating %s %v", id, meta.Args)
-	status, err := w.runc.Run(ctx, id, bundle, &runc.CreateOpts{
+	status, err := w.runc.Run(runCtx, id, bundle, &runc.CreateOpts{
 		IO: &forwardIO{stdin: stdin, stdout: stdout, stderr: stderr},
 	})
+	close(done)
 	if err != nil {
 		return err
 	}
 
 	if status != 0 {
-		return errors.Errorf("exit code: %d", status)
+		err := errors.Errorf("exit code: %d", status)
+		select {
+		case <-ctx.Done():
+			return errors.Wrapf(ctx.Err(), err.Error())
+		default:
+			return err
+		}
 	}
 
 	return nil

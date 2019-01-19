@@ -3,6 +3,7 @@ package containerdexecutor
 import (
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -31,7 +32,12 @@ type containerdExecutor struct {
 	cgroupParent     string
 }
 
+// New creates a new executor backed by connection to containerd API
 func New(client *containerd.Client, root, cgroup string, networkProviders map[pb.NetMode]network.Provider) executor.Executor {
+	// clean up old hosts/resolv.conf file. ignore errors
+	os.RemoveAll(filepath.Join(root, "hosts"))
+	os.RemoveAll(filepath.Join(root, "resolv.conf"))
+
 	return containerdExecutor{
 		client:           client,
 		root:             root,
@@ -114,7 +120,8 @@ func (w containerdExecutor) Exec(ctx context.Context, meta executor.Meta, root c
 		}
 		opts = append(opts, containerdoci.WithCgroup(cgroupsPath))
 	}
-	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, opts...)
+	processMode := oci.ProcessSandbox // FIXME(AkihiroSuda)
+	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, processMode, opts...)
 	if err != nil {
 		return err
 	}
@@ -166,7 +173,13 @@ func (w containerdExecutor) Exec(ctx context.Context, meta executor.Meta, root c
 				cancel()
 			}
 			if status.ExitCode() != 0 {
-				return errors.Errorf("process returned non-zero exit code: %d", status.ExitCode())
+				err := errors.Errorf("process returned non-zero exit code: %d", status.ExitCode())
+				select {
+				case <-ctx.Done():
+					err = errors.Wrap(ctx.Err(), err.Error())
+				default:
+				}
+				return err
 			}
 			return nil
 		}

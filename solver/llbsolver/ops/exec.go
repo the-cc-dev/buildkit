@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/containerd/containerd/mount"
 	"github.com/docker/docker/pkg/locker"
 	"github.com/moby/buildkit/cache"
@@ -32,11 +31,13 @@ import (
 	"github.com/moby/buildkit/solver/llbsolver"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/progress/logs"
+	utilsystem "github.com/moby/buildkit/util/system"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/opencontainers/runc/libcontainer/system"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -301,7 +302,7 @@ func (e *execOp) getSSHMountable(ctx context.Context, m *pb.Mount) (cache.Mounta
 			return nil, nil
 		}
 		if st, ok := status.FromError(err); ok && st.Code() == codes.Unimplemented {
-			return nil, errors.Errorf("no ssh forwarded from the client")
+			return nil, errors.Errorf("no SSH key %q forwarded from the client", m.SSHOpt.ID)
 		}
 		return nil, err
 	}
@@ -330,7 +331,7 @@ func (sm *sshMountInstance) Mount() ([]mount.Mount, error) {
 		ID:   sm.sm.mount.SSHOpt.ID,
 		UID:  int(sm.sm.mount.SSHOpt.Uid),
 		GID:  int(sm.sm.mount.SSHOpt.Gid),
-		Mode: int(sm.sm.mount.SSHOpt.Mode),
+		Mode: int(sm.sm.mount.SSHOpt.Mode & 0777),
 	})
 	if err != nil {
 		cancel()
@@ -446,7 +447,7 @@ func (sm *secretMountInstance) Mount() ([]mount.Mount, error) {
 		return nil, err
 	}
 
-	if err := os.Chmod(fp, os.FileMode(sm.sm.mount.SecretOpt.Mode)); err != nil {
+	if err := os.Chmod(fp, os.FileMode(sm.sm.mount.SecretOpt.Mode&0777)); err != nil {
 		return nil, err
 	}
 
@@ -465,6 +466,15 @@ func (sm *secretMountInstance) Release() error {
 		return os.RemoveAll(sm.root)
 	}
 	return nil
+}
+
+func addDefaultEnvvar(env []string, k, v string) []string {
+	for _, e := range env {
+		if strings.HasPrefix(e, k+"=") {
+			return env
+		}
+	}
+	return append(env, k+"="+v)
 }
 
 func (e *execOp) Exec(ctx context.Context, inputs []solver.Result) ([]solver.Result, error) {
@@ -626,6 +636,7 @@ func (e *execOp) Exec(ctx context.Context, inputs []solver.Result) ([]solver.Res
 	if e.op.Meta.ProxyEnv != nil {
 		meta.Env = append(meta.Env, proxyEnvList(e.op.Meta.ProxyEnv)...)
 	}
+	meta.Env = addDefaultEnvvar(meta.Env, "PATH", utilsystem.DefaultPathEnv)
 
 	stdout, stderr := logs.NewLogStreams(ctx, os.Getenv("BUILDKIT_DEBUG_EXEC_OUTPUT") == "1")
 	defer stdout.Close()

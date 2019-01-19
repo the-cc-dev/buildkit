@@ -23,6 +23,7 @@ import (
 	"github.com/moby/buildkit/frontend/dockerfile/shell"
 	gw "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/apicaps"
 	"github.com/moby/buildkit/util/system"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -34,7 +35,7 @@ const (
 	localNameContext = "context"
 	historyComment   = "buildkit.dockerfile.v0"
 
-	DefaultCopyImage = "tonistiigi/copy:v0.1.4@sha256:d9d49bedbbe2b27df88115e6aff7b9cd11ed2fbd8d9013f02d3da735c08c92e5"
+	DefaultCopyImage = "docker/dockerfile-copy:v0.1.9@sha256:e8f159d3f00786604b93c675ee2783f8dc194bb565e61ca5788f6a6e9d304061"
 )
 
 type ConvertOpt struct {
@@ -57,6 +58,7 @@ type ConvertOpt struct {
 	ExtraHosts        []llb.HostIP
 	ForceNetMode      pb.NetMode
 	OverrideCopyImage string
+	LLBCaps           *apicaps.CapSet
 }
 
 func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State, *Image, error) {
@@ -210,7 +212,7 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 				eg.Go(func() error {
 					ref, err := reference.ParseNormalizedNamed(d.stage.BaseName)
 					if err != nil {
-						return err
+						return errors.Wrapf(err, "failed to parse stage name %q", d.stage.BaseName)
 					}
 					platform := d.platform
 					if platform == nil {
@@ -248,9 +250,15 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 								}
 							}
 							d.stage.BaseName = ref.String()
-							_ = ref
 							if len(img.RootFS.DiffIDs) == 0 {
 								isScratch = true
+								// schema1 images can't return diffIDs so double check :(
+								for _, h := range img.History {
+									if !h.EmptyLayer {
+										isScratch = false
+										break
+									}
+								}
 							}
 						}
 					}
@@ -318,6 +326,7 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 			targetPlatform:    platformOpt.targetPlatform,
 			extraHosts:        opt.ExtraHosts,
 			copyImage:         opt.OverrideCopyImage,
+			llbCaps:           opt.LLBCaps,
 		}
 		if opt.copyImage == "" {
 			opt.copyImage = DefaultCopyImage
@@ -361,7 +370,13 @@ func Dockerfile2LLB(ctx context.Context, dt []byte, opt ConvertOpt) (*llb.State,
 	}
 	buildContext.Output = bc.Output()
 
-	st := target.state.SetMarshalDefaults(llb.Platform(platformOpt.targetPlatform))
+	defaults := []llb.ConstraintsOpt{
+		llb.Platform(platformOpt.targetPlatform),
+	}
+	if opt.LLBCaps != nil {
+		defaults = append(defaults, llb.WithCaps(*opt.LLBCaps))
+	}
+	st := target.state.SetMarshalDefaults(defaults...)
 
 	if !platformOpt.implicitTarget {
 		target.image.OS = platformOpt.targetPlatform.OS
@@ -426,6 +441,7 @@ type dispatchOpt struct {
 	buildPlatforms    []specs.Platform
 	extraHosts        []llb.HostIP
 	copyImage         string
+	llbCaps           *apicaps.CapSet
 }
 
 func dispatch(d *dispatchState, cmd command, opt dispatchOpt) error {
@@ -452,7 +468,9 @@ func dispatch(d *dispatchState, cmd command, opt dispatchOpt) error {
 		err = dispatchCopy(d, c.SourcesAndDest, opt.buildContext, true, c, "", opt)
 		if err == nil {
 			for _, src := range c.Sources() {
-				d.ctxPaths[path.Join("/", filepath.ToSlash(src))] = struct{}{}
+				if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
+					d.ctxPaths[path.Join("/", filepath.ToSlash(src))] = struct{}{}
+				}
 			}
 		}
 	case *instructions.LabelCommand:
@@ -593,8 +611,10 @@ func dispatchRun(d *dispatchState, c *instructions.RunCommand, proxy *llb.ProxyE
 	if c.PrependShell {
 		args = withShell(d.image, args)
 	}
+	env := d.state.Env()
 	opt := []llb.RunOption{llb.Args(args)}
 	for _, arg := range d.buildArgs {
+		env = append(env, fmt.Sprintf("%s=%s", arg.Key, arg.ValueString()))
 		opt = append(opt, llb.AddEnv(arg.Key, arg.ValueString()))
 	}
 	opt = append(opt, dfCmd(c))
@@ -610,7 +630,12 @@ func dispatchRun(d *dispatchState, c *instructions.RunCommand, proxy *llb.ProxyE
 		return err
 	}
 	opt = append(opt, runMounts...)
-	opt = append(opt, llb.WithCustomName(prefixCommand(d, uppercaseCmd(processCmdEnv(dopt.shlex, c.String(), d.state.Run(opt...).Env())), d.prefixPlatform, d.state.GetPlatform())))
+
+	shlex := *dopt.shlex
+	shlex.RawQuotes = true
+	shlex.SkipUnsetEnv = true
+
+	opt = append(opt, llb.WithCustomName(prefixCommand(d, uppercaseCmd(processCmdEnv(&shlex, c.String(), env)), d.prefixPlatform, d.state.GetPlatform())))
 	for _, h := range dopt.extraHosts {
 		opt = append(opt, llb.AddExtraHost(h.Host, h.IP))
 	}
@@ -636,7 +661,7 @@ func dispatchCopy(d *dispatchState, c instructions.SourcesAndDest, sourceState l
 	img := llb.Image(opt.copyImage, llb.MarkImageInternal, llb.Platform(opt.buildPlatforms[0]), WithInternalName("helper image for file operations"))
 
 	dest := path.Join(".", pathRelativeToWorkingDir(d.state, c.Dest()))
-	if c.Dest() == "." || c.Dest()[len(c.Dest())-1] == filepath.Separator {
+	if c.Dest() == "." || c.Dest() == "" || c.Dest()[len(c.Dest())-1] == filepath.Separator {
 		dest += string(filepath.Separator)
 	}
 	args := []string{"copy"}
@@ -712,6 +737,13 @@ func dispatchCopy(d *dispatchState, c instructions.SourcesAndDest, sourceState l
 	if d.ignoreCache {
 		runOpt = append(runOpt, llb.IgnoreCache)
 	}
+
+	if opt.llbCaps != nil {
+		if err := opt.llbCaps.Supports(pb.CapExecMetaNetwork); err == nil {
+			runOpt = append(runOpt, llb.Network(llb.NetModeNone))
+		}
+	}
+
 	run := img.Run(append(runOpt, mounts...)...)
 	d.state = run.AddMount("/dest", d.state).Platform(platform)
 
